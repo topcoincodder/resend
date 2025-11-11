@@ -8,7 +8,8 @@ import {
   type ActionCtx,
 } from "./_generated/server.js";
 import { Workpool } from "@convex-dev/workpool";
-import { RateLimiter } from "@convex-dev/rate-limiter";
+import { RateLimiter, SECOND } from "@convex-dev/rate-limiter";
+import type { RateLimitConfig } from "@convex-dev/rate-limiter";
 import { api, components, internal } from "./_generated/api.js";
 import { internalMutation } from "./_generated/server.js";
 import { type Id, type Doc } from "./_generated/dataModel.js";
@@ -19,7 +20,7 @@ import {
   vStatus,
 } from "./shared.js";
 import type { FunctionHandle } from "convex/server";
-import type { EmailEvent, RunMutationCtx } from "./shared.js";
+import type { EmailEvent } from "./shared.js";
 import { isDeepEqual } from "remeda";
 import schema from "./schema.js";
 import { omit } from "convex-helpers";
@@ -38,6 +39,8 @@ const BATCH_SIZE = 100;
 const EMAIL_POOL_SIZE = 4;
 const CALLBACK_POOL_SIZE = 4;
 const RESEND_ONE_CALL_EVERY_MS = 600; // Half the stated limit, but it keeps us sane.
+const DEFAULT_EMAILS_PER_SECOND = SECOND / RESEND_ONE_CALL_EVERY_MS;
+const MIN_EMAILS_PER_SECOND = 0.1;
 const FINALIZED_EMAIL_RETENTION_MS = 1000 * 60 * 60 * 24 * 7; // 7 days
 const FINALIZED_EPOCH = Number.MAX_SAFE_INTEGER;
 const ABANDONED_EMAIL_RETENTION_MS = 1000 * 60 * 60 * 24 * 30; // 30 days
@@ -68,13 +71,7 @@ const callbackPool = new Workpool(components.callbackWorkpool, {
 
 // We rate limit our calls to the Resend API.
 // FUTURE -- make this rate configurable if an account ups its sending rate with Resend.
-const resendApiRateLimiter = new RateLimiter(components.rateLimiter, {
-  resendApi: {
-    kind: "fixed window",
-    period: RESEND_ONE_CALL_EVERY_MS,
-    rate: 1,
-  },
-});
+const resendApiRateLimiter = new RateLimiter(components.rateLimiter);
 
 // Enqueue an email to be send.  A background job will grab batches
 // of emails and enqueue them to be sent by the workpool.
@@ -154,6 +151,23 @@ export const sendEmail = mutation({
   },
 });
 
+async function getResendRateLimitConfig(
+  ctx: MutationCtx,
+): Promise<RateLimitConfig> {
+  const record = await ctx.db.query("resendOptions").unique();
+  const raw = record?.options.rateLimitEmailsPerSecond;
+  const emailsPerSecond =
+    typeof raw === "number" && Number.isFinite(raw) && raw > 0
+      ? Math.max(raw, MIN_EMAILS_PER_SECOND)
+      : Math.max(DEFAULT_EMAILS_PER_SECOND, MIN_EMAILS_PER_SECOND);
+  return {
+    kind: "token bucket",
+    rate: emailsPerSecond,
+    period: SECOND,
+    capacity: Math.max(emailsPerSecond, 1),
+  };
+}
+
 export const createManualEmail = mutation({
   args: {
     from: v.string(),
@@ -228,6 +242,26 @@ export const cancelEmail = mutation({
       status: "cancelled",
       finalizedAt: Date.now(),
     });
+  },
+});
+
+export const setResendRateLimit = mutation({
+  args: { rateLimitEmailsPerSecond: v.number() },
+  returns: v.null(),
+  handler: async (ctx, { rateLimitEmailsPerSecond }) => {
+    if (
+      !Number.isFinite(rateLimitEmailsPerSecond) ||
+      rateLimitEmailsPerSecond <= 0
+    ) {
+      throw new Error("rateLimitEmailsPerSecond must be a positive number");
+    }
+    const existing = await ctx.db.query("resendOptions").unique();
+    const options = { rateLimitEmailsPerSecond };
+    if (existing) {
+      await ctx.db.patch(existing._id, { options });
+    } else {
+      await ctx.db.insert("resendOptions", { options });
+    }
   },
 });
 
@@ -613,9 +647,11 @@ async function createResendBatchPayload(
 }
 
 const FIXED_WINDOW_DELAY = 100;
-async function getDelay(ctx: RunMutationCtx): Promise<number> {
+async function getDelay(ctx: MutationCtx): Promise<number> {
+  const config = await getResendRateLimitConfig(ctx);
   const limit = await resendApiRateLimiter.limit(ctx, "resendApi", {
     reserve: true,
+    config,
   });
   //console.log(`RL: ${limit.ok} ${limit.retryAfter}`);
   const jitter = Math.random() * FIXED_WINDOW_DELAY;
